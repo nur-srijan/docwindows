@@ -17,13 +17,16 @@ RUN set -eu && \
     apt-get update && \
     apt-get --no-install-recommends -y install \
         samba \
+        cpu-checker \
         wimtools \
         dos2unix \
         cabextract \
         libxml2-utils \
         libarchive-tools && \
+    sudo modprobe kvm_amd
     wget "https://github.com/gershnik/wsdd-native/releases/download/v${VERSION_WSDD}/wsddn_${VERSION_WSDD}_${TARGETARCH}.deb" -O /tmp/wsddn.deb -q --timeout=10 && \
     dpkg -i /tmp/wsddn.deb && \
+    kvm-ok \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
