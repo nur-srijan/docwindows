@@ -23,10 +23,10 @@ RUN set -eu && \
         cabextract \
         libxml2-utils \
         libarchive-tools && \
-    sudo modprobe kvm_amd
+    sudo modprobe kvm_amd \
+    kvm-ok \
     wget "https://github.com/gershnik/wsdd-native/releases/download/v${VERSION_WSDD}/wsddn_${VERSION_WSDD}_${TARGETARCH}.deb" -O /tmp/wsddn.deb -q --timeout=10 && \
     dpkg -i /tmp/wsddn.deb && \
-    kvm-ok \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
@@ -44,7 +44,7 @@ RUN echo "$VERSION_ARG" > /etc/version
 VOLUME /storage
 EXPOSE 3389 8006
 
-ENV VERSION="11"
+ENV VERSION="xp"
 ENV RAM_SIZE="4G"
 ENV CPU_CORES="2"
 ENV DISK_SIZE="64G"
