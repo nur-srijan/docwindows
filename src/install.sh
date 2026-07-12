@@ -110,7 +110,7 @@ skipInstall() {
   # Check if the ISO was already processed by our script
   magic=$(dd if="$iso" bs=1 count=1 status=none | tr -d '\000')
   magic="$(printf '%s' "$magic" | od -A n -t x1 -v | tr -d ' \n')"
-  byte="16" && [[ "$MANUAL" == [Yy1]* ]] && byte="17"
+  byte="16" && enabled "$MANUAL" && byte="17"
 
   if [[ "$magic" != "$byte" ]]; then
 
@@ -185,15 +185,19 @@ startInstall() {
   return 0
 }
 
-writeFile() {
+checkFreeSpace() {
 
-  local txt="$1"
-  local path="$2"
+  local dir="$1"
+  local size="$2"
+  local size_gb space space_gb
 
-  echo "$txt" >"$path"
+  size_gb=$(formatBytes "$size")
+  space=$(df --output=avail -B 1 "$dir" | tail -n 1)
+  space_gb=$(formatBytes "$space")
 
-  if ! setOwner "$path"; then
-    error "Failed to set the owner for \"$path\" !"
+  if (( size > space )); then
+    error "Not enough free space in $STORAGE, have $space_gb available but need at least $size_gb."
+    return 1
   fi
 
   return 0
@@ -210,79 +214,76 @@ finishInstall() {
   fi
 
   if [[ "$iso" == "$STORAGE/"* ]]; then
-    ! setOwner "$iso" && error "Failed to set the owner for \"$iso\" !"
+    if ! setOwner "$iso"; then
+      error "Failed to set the owner for \"$iso\" !"
+      return 1
+    fi
   fi
 
   if [[ "$aborted" != [Yy1]* ]]; then
     # Mark ISO as prepared via magic byte
-    byte="16" && [[ "$MANUAL" == [Yy1]* ]] && byte="17"
+    byte="16" && enabled "$MANUAL" && byte="17"
     if ! printf '%b' "\x$byte" | dd of="$iso" bs=1 seek=0 count=1 conv=notrunc status=none; then
       warn "failed to set magic byte in ISO file: $iso"
     fi
   fi
 
   local file="$STORAGE/windows.ver"
-  cp -f /etc/version "$file"
-  ! setOwner "$file" && error "Failed to set the owner for \"$file\" !"
+  cp -f /etc/version "$file" || return 1
+
+  if ! setOwner "$file"; then
+    error "Failed to set the owner for \"$file\" !"
+    return 1
+  fi
 
   if [[ "$iso" == "$STORAGE/"* ]]; then
     if [[ "$aborted" != [Yy1]* ]] || [ -z "$CUSTOM" ]; then
       base=$(basename "$iso")
-      file="$STORAGE/windows.base"
-      writeFile "$base" "$file"
+      writeState "base" "$base" || return 1
     fi
   fi
 
   if [[ "${PLATFORM,,}" == "x64" ]]; then
     if [[ "${BOOT_MODE,,}" == "windows_legacy" ]]; then
-      file="$STORAGE/windows.mode"
-      writeFile "$BOOT_MODE" "$file"
+      writeState "mode" "$BOOT_MODE" || return 1
       if [[ "${MACHINE,,}" != "q35" ]]; then
-        file="$STORAGE/windows.old"
-        writeFile "$MACHINE" "$file"
+        writeState "old" "$MACHINE" || return 1
       fi
     else
       # Enable secure boot + TPM on manual installs as Win11 requires
-      if [[ "$MANUAL" == [Yy1]* || "$aborted" == [Yy1]* ]]; then
+      if enabled "$MANUAL" || [[ "$aborted" == [Yy1]* ]]; then
         if [[ "${DETECTED,,}" == "win11"* ]]; then
           BOOT_MODE="windows_secure"
-          file="$STORAGE/windows.mode"
-          writeFile "$BOOT_MODE" "$file"
+          writeState "mode" "$BOOT_MODE" || return 1
         fi
       fi
       # Enable secure boot on multi-socket systems to workaround freeze
       if [ -n "$SOCKETS" ] && [[ "$SOCKETS" != "1" ]]; then
         BOOT_MODE="windows_secure"
-        file="$STORAGE/windows.mode"
-        writeFile "$BOOT_MODE" "$file"
+        writeState "mode" "$BOOT_MODE" || return 1
       fi
     fi
   fi
 
   if [ -n "${ARGS:-}" ]; then
     ARGUMENTS="$ARGS ${ARGUMENTS:-}"
-    file="$STORAGE/windows.args"
-    writeFile "$ARGS" "$file"
+    writeState "args" "$ARGS" || return 1
   fi
 
   if [ -n "${VGA:-}" ] && [[ "${VGA:-}" != "virtio"* ]]; then
-    file="$STORAGE/windows.vga"
-    writeFile "$VGA" "$file"
+    writeState "vga" "$VGA" || return 1
   fi
 
   if [ -n "${USB:-}" ] && [[ "${USB:-}" != "qemu-xhci"* ]]; then
-    file="$STORAGE/windows.usb"
-    writeFile "$USB" "$file"
+    writeState "usb" "$USB" || return 1
   fi
 
   if [ -n "${DISK_TYPE:-}" ] && [[ "${DISK_TYPE:-}" != "scsi" ]]; then
-    file="$STORAGE/windows.type"
-    writeFile "$DISK_TYPE" "$file"
+    writeState "type" "$DISK_TYPE" || return 1
   fi
 
   if [ -n "${ADAPTER:-}" ] && [[ "${ADAPTER:-}" != "virtio-net-pci" ]]; then
-    file="$STORAGE/windows.net"
-    writeFile "$ADAPTER" "$file"
+    writeState "net" "$ADAPTER" || return 1
   fi
 
   rm -rf "$TMP"
@@ -296,7 +297,7 @@ abortInstall() {
   local efi
 
   [[ "${iso,,}" == *".esd" ]] && exit 60
-  [[ "${UNPACK:-}" == [Yy1]* ]] && exit 60
+  enabled "${UNPACK:-}" && exit 60
 
   efi=$(find "$dir" -maxdepth 1 -type d -iname efi -print -quit)
 
@@ -370,95 +371,135 @@ detectCustom() {
   return 0
 }
 
+getEsdField() {
+
+  local list="$1"
+  local index="$2"
+
+  sed -n "${index}p" <<< "$list" | tr -cd '0-9'
+
+  return 0
+}
+
 extractESD() {
 
   local iso="$1"
   local dir="$2"
   local version="$3"
   local desc="$4"
-  local size size_gb sizes space space_gb
-  local retVal total total1 total2 total3 total4
-  local imageIndex links links1 links2 links3 links4
 
-  local msg="Extracting $desc bootdisk"
+  local msg ret index
+  local minSize freeSpace bootPad installPad
+  local info count totals links
+  local bootTotal bootLinks bootSize
+  local wimTotal wimLinks wimSize
+  local installSize
+  local bootWim installWim
+  local edition imgEdition
+
+  minSize=100000000
+  freeSpace=9606127360
+  bootPad=60000000
+  installPad=3000000
+
+  msg="Extracting $desc bootdisk"
   info "$msg..." && html "$msg..."
 
-  if [ "$(stat -c%s "$iso")" -lt 100000000 ]; then
-    error "Invalid ESD file: Size is smaller than 100 MB" && return 1
+  if [ "$(stat -c%s "$iso")" -lt "$minSize" ]; then
+    error "Invalid ESD file: Size is smaller than 100 MB"
+    return 1
   fi
 
   rm -rf "$dir"
 
   if ! makeDir "$dir"; then
-    error "Failed to create directory \"$dir\" !" && return 1
+    error "Failed to create directory \"$dir\" !"
+    return 1
   fi
 
-  size=9606127360
-  size_gb=$(formatBytes "$size")
-  space=$(df --output=avail -B 1 "$dir" | tail -n 1)
-  space_gb=$(formatBytes "$space")
+  checkFreeSpace "$dir" "$freeSpace" || return 1
 
-  if (( size > space )); then
-    error "Not enough free space in $STORAGE, have $space_gb available but need at least $size_gb." && return 1
+  info=$(wimlib-imagex info "$iso") || {
+    error "Cannot read ESD file information!"
+    return 1
+  }
+
+  count=$(awk '/Image Count:/ {print $3}' <<< "$info")
+
+  if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+    error "Cannot read the image count in ESD file!"
+    return 1
   fi
 
-  local esdImageCount
-  esdImageCount=$(wimlib-imagex info "$iso" | awk '/Image Count:/ {print $3}')
-
-  if [ -z "$esdImageCount" ]; then
-    error "Cannot read the image count in ESD file!" && return 1
+  if (( count < 3 )); then
+    error "Invalid ESD file: expected at least 3 images, found $count."
+    return 1
   fi
 
-  sizes=$(wimlib-imagex info "$iso" | grep "Total Bytes:")
-  links=$(wimlib-imagex info "$iso" | grep "Hard Link Bytes:")
+  totals=$(grep "Total Bytes:" <<< "$info" || true)
+  links=$(grep "Hard Link Bytes:" <<< "$info" || true)
 
-  total1=$(awk "NR==1{ print; }" <<< "$sizes" | cut -d':' -f2 | sed 's/^ *//')
-  links1=$(awk "NR==1{ print; }" <<< "$links" | cut -d':' -f2 | sed 's/^ *//')
-  total=$(( total1 - links1 ))
+  bootTotal=$(getEsdField "$totals" 1)
+  bootLinks=$(getEsdField "$links" 1)
 
-  total3=$(awk "NR==3{ print; }" <<< "$sizes" | cut -d':' -f2 | sed 's/^ *//')
-  links3=$(awk "NR==3{ print; }" <<< "$links" | cut -d':' -f2 | sed 's/^ *//')
-  total3=$(( total3 - links3 ))
-  total3=$(( total3 + 60000000 ))
+  if [[ ! "$bootTotal" =~ ^[0-9]+$ ]] || [[ ! "$bootLinks" =~ ^[0-9]+$ ]]; then
+    error "Cannot read bootdisk size from ESD file!"
+    return 1
+  fi
 
-  /run/progress.sh "$dir" "$total" "$msg ([P])..." &
+  bootSize=$(( bootTotal - bootLinks ))
 
-  imageIndex="1"
-  wimlib-imagex apply "$iso" "$imageIndex" "$dir" --quiet 2>/dev/null || {
-    retVal=$?
+  wimTotal=$(getEsdField "$totals" 3)
+  wimLinks=$(getEsdField "$links" 3)
+
+  if [[ ! "$wimTotal" =~ ^[0-9]+$ ]] || [[ ! "$wimLinks" =~ ^[0-9]+$ ]]; then
+    error "Cannot read boot.wim size from ESD file!"
+    return 1
+  fi
+
+  wimSize=$(( wimTotal - wimLinks + bootPad ))
+
+  /run/progress.sh "$dir" "$bootSize" "$msg ([P])..." &
+
+  index="1"
+  wimlib-imagex apply "$iso" "$index" "$dir" --quiet 2>/dev/null || {
+    ret=$?
     fKill "progress.sh"
-    error "Extracting $desc bootdisk failed ($retVal)" && return 1
+    error "Extracting $desc bootdisk failed ($ret)"
+    return 1
   }
 
   fKill "progress.sh"
 
-  local bootWimFile="$dir/sources/boot.wim"
-  local installWimFile="$dir/sources/install.wim"
+  bootWim="$dir/sources/boot.wim"
+  installWim="$dir/sources/install.wim"
 
-  local msg="Extracting $desc environment"
+  msg="Extracting $desc environment"
   info "$msg..." && html "$msg..."
 
-  imageIndex="2"
-  /run/progress.sh "$bootWimFile" "$total3" "$msg ([P])..." &
+  index="2"
+  /run/progress.sh "$bootWim" "$wimSize" "$msg ([P])..." &
 
-  wimlib-imagex export "$iso" "$imageIndex" "$bootWimFile" --compress=none --quiet || {
-    retVal=$?
+  wimlib-imagex export "$iso" "$index" "$bootWim" --compress=none --quiet || {
+    ret=$?
     fKill "progress.sh"
-    error "Adding WinPE failed ($retVal)" && return 1
+    error "Adding WinPE failed ($ret)"
+    return 1
   }
 
   fKill "progress.sh"
 
-  local msg="Extracting $desc setup"
+  msg="Extracting $desc setup"
   info "$msg..."
 
-  imageIndex="3"
-  /run/progress.sh "$bootWimFile" "$total3" "$msg ([P])..." &
+  index="3"
+  /run/progress.sh "$bootWim" "$wimSize" "$msg ([P])..." &
 
-  wimlib-imagex export "$iso" "$imageIndex" "$bootWimFile" --compress=none --boot --quiet || {
-    retVal=$?
+  wimlib-imagex export "$iso" "$index" "$bootWim" --compress=none --boot --quiet || {
+    ret=$?
     fKill "progress.sh"
-    error "Adding Windows Setup failed ($retVal)" && return 1
+    error "Adding Windows Setup failed ($ret)"
+    return 1
   }
 
   fKill "progress.sh"
@@ -469,30 +510,31 @@ extractESD() {
     LABEL="CPBA_A64FRE_EN-US_DV9"
   fi
 
-  local msg="Extracting $desc image"
+  msg="Extracting $desc image"
   info "$msg..." && html "$msg..."
 
-  local edition imageEdition
   edition=$(getCatalog "$version" "name")
 
   if [ -z "$edition" ]; then
-    error "Invalid VERSION specified, value \"$version\" is not recognized!" && return 1
+    error "Invalid VERSION specified, value \"$version\" is not recognized!"
+    return 1
   fi
 
-  for (( imageIndex=4; imageIndex<=esdImageCount; imageIndex++ )); do
+  for (( index=4; index<=count; index++ )); do
 
-    imageEdition=$(wimlib-imagex info "$iso" "$imageIndex" | grep '^Description:' | sed 's/Description:[ \t]*//')
-    [[ "${imageEdition,,}" != "${edition,,}" ]] && continue
+    imgEdition=$(wimlib-imagex info "$iso" "$index" | grep '^Description:' | sed 's/Description:[ \t]*//')
+    [[ "${imgEdition,,}" != "${edition,,}" ]] && continue
 
-    total4=$(du -sb "$iso" | cut -f1)
-    total4=$(( total4 + 3000000 ))
+    installSize=$(stat -c%s "$iso")
+    installSize=$(( installSize + installPad ))
 
-    /run/progress.sh "$installWimFile" "$total4" "$msg ([P])..." &
+    /run/progress.sh "$installWim" "$installSize" "$msg ([P])..." &
 
-    wimlib-imagex export "$iso" "$imageIndex" "$installWimFile" --compress=LZMS --chunk-size 128K --quiet || {
-      retVal=$?
+    wimlib-imagex export "$iso" "$index" "$installWim" --compress=LZMS --chunk-size 128K --quiet || {
+      ret=$?
       fKill "progress.sh"
-      error "Addition of $imageIndex to the $desc image failed ($retVal)" && return 1
+      error "Addition of $index to the $desc image failed ($ret)"
+      return 1
     }
 
     fKill "progress.sh"
@@ -501,7 +543,8 @@ extractESD() {
   done
 
   fKill "progress.sh"
-  error "Failed to find product '$edition' in install.wim!" && return 1
+  error "Failed to find product '$edition' in install.wim!"
+  return 1
 }
 
 extractImage() {
@@ -510,7 +553,7 @@ extractImage() {
   local dir="$2"
   local version="$3"
   local desc="local ISO"
-  local file size size_gb space space_gb
+  local file size
 
   if [ -z "$CUSTOM" ]; then
     desc="downloaded ISO"
@@ -534,17 +577,12 @@ extractImage() {
   fi
 
   size=$(stat -c%s "$iso")
-  size_gb=$(formatBytes "$size")
-  space=$(df --output=avail -B 1 "$dir" | tail -n 1)
-  space_gb=$(formatBytes "$space")
 
   if (( size < 100000000 )); then
     error "Invalid ISO file: Size is smaller than 100 MB" && return 1
   fi
 
-  if (( size > space )); then
-    error "Not enough free space in $STORAGE, have $space_gb available but need at least $size_gb." && return 1
-  fi
+  checkFreeSpace "$dir" "$size" || return 1
 
   rm -rf "$dir"
   /run/progress.sh "$dir" "$size" "$msg ([P])..." &
@@ -556,9 +594,9 @@ extractImage() {
 
   fKill "progress.sh"
 
-  if [[ "${UNPACK:-}" != [Yy1]* ]]; then
+  if ! enabled "${UNPACK:-}"; then
 
-    LABEL=$(isoinfo -d -i "$iso" | sed -n 's/Volume id: //p')
+    LABEL=$(isoinfo -d -i "$iso" | sed -n 's/Volume id: //p') || LABEL=""
 
   else
 
@@ -572,8 +610,8 @@ extractImage() {
       error "Failed to extract archive!" && return 1
     fi
 
-    LABEL=$(isoinfo -d -i "$file" | sed -n 's/Volume id: //p')
-    rm -f "$file"
+    LABEL=$(isoinfo -d -i "$file" | sed -n 's/Volume id: //p') || LABEL=""
+    rm -f "$file" || warn "Failed to remove temporary ISO file: $file"
 
   fi
 
@@ -727,7 +765,7 @@ detectImage() {
 
   local dir="$1"
   local version="$2"
-  local desc msg find language
+  local desc msg language
 
   XML=""
 
@@ -739,7 +777,7 @@ detectImage() {
 
     skipVersion "${DETECTED,,}" && return 0
 
-    if ! setXML "" && [[ "$MANUAL" != [Yy1]* ]]; then
+    if ! setXML "" && ! enabled "$MANUAL"; then
       MANUAL="Y"
       desc=$(printEdition "$DETECTED" "this version")
       warn "the answer file for $desc was not found ($DETECTED.xml), $FB."
@@ -769,14 +807,18 @@ detectImage() {
     warn "failed to locate 'install.wim' or 'install.esd' in ISO image, $FB" && return 1
   fi
 
-  info=$(wimlib-imagex info -xml "$wim" | iconv -f UTF-16LE -t UTF-8)
+  if ! info=$(wimlib-imagex info -xml "$wim" | iconv -f UTF-16LE -t UTF-8); then
+    warn "failed to read Windows image information, $FB"
+    return 1
+  fi
+
   checkPlatform "$info" || exit 67
 
   DETECTED=$(detectVersion "$info")
 
   if [ -z "$DETECTED" ]; then
     msg="Failed to determine Windows version from image"
-    if setXML "" || [[ "$MANUAL" == [Yy1]* ]]; then
+    if setXML "" || enabled "$MANUAL"; then
       info "${msg}!"
     else
       MANUAL="Y"
@@ -803,8 +845,8 @@ detectImage() {
   msg="the answer file for $desc was not found ($DETECTED.xml)"
   local fallback="/run/assets/${DETECTED%%-*}.xml"
 
-  if setXML "$fallback" || [[ "$MANUAL" == [Yy1]* ]]; then
-    [[ "$MANUAL" != [Yy1]* ]] && warn "${msg}."
+  if setXML "$fallback" || enabled "$MANUAL"; then
+    ! enabled "$MANUAL" && warn "${msg}."
   else
     MANUAL="Y"
     warn "${msg}, $FB."
@@ -845,7 +887,7 @@ updateXML() {
 
   local asset="$1"
   local language="$2"
-  local culture region user admin pass keyboard
+  local culture region user admin pass pw keyboard
 
   [ -z "$HEIGHT" ] && HEIGHT="720"
   [ -z "$WIDTH" ] && WIDTH="1280"
@@ -996,22 +1038,12 @@ addDrivers() {
 
   wimlib-imagex update "$file" "$index" --command "delete --force --recursive /$target" >/dev/null || true
 
-  addDriver "$version" "$drivers" "$target" "qxl" || return 1
-  addDriver "$version" "$drivers" "$target" "viofs" || return 1
-  addDriver "$version" "$drivers" "$target" "sriov" || return 1
-  addDriver "$version" "$drivers" "$target" "smbus" || return 1
-  addDriver "$version" "$drivers" "$target" "qxldod" || return 1
-  addDriver "$version" "$drivers" "$target" "viorng" || return 1
-  addDriver "$version" "$drivers" "$target" "viostor" || return 1
-  addDriver "$version" "$drivers" "$target" "viomem" || return 1
-  addDriver "$version" "$drivers" "$target" "NetKVM" || return 1
-  addDriver "$version" "$drivers" "$target" "Balloon" || return 1
-  addDriver "$version" "$drivers" "$target" "vioscsi" || return 1
-  addDriver "$version" "$drivers" "$target" "pvpanic" || return 1
-  addDriver "$version" "$drivers" "$target" "vioinput" || return 1
-  addDriver "$version" "$drivers" "$target" "viogpudo" || return 1
-  addDriver "$version" "$drivers" "$target" "vioserial" || return 1
-  addDriver "$version" "$drivers" "$target" "qemupciserial" || return 1
+  local driver
+  local driver_list=( qxl viofs sriov smbus qxldod viorng viostor viomem NetKVM Balloon vioscsi pvpanic vioinput viogpudo vioserial qemupciserial )
+
+  for driver in "${driver_list[@]}"; do
+    addDriver "$version" "$drivers" "$target" "$driver" || return 1
+  done
 
   local dst="$src/\$OEM\$/\$\$/Drivers"
   mkdir -p "$dst" || return 1
@@ -1038,16 +1070,16 @@ updateImage() {
   local asset="$2"
   local language="$3"
   local tmp="/tmp/install"
-  local file="autounattend.xml"
-  local org="${file//.xml/.org}"
-  local dat="${file//.xml/.dat}"
-  local desc path src wim xml index result
+  local xml="autounattend.xml"
+  local bak="${xml//.xml/.org}"
+  local dat="${xml//.xml/.dat}"
+  local desc path src wim name info idx
 
   skipVersion "${DETECTED,,}" && return 0
 
   if [ ! -s "$asset" ] || [ ! -f "$asset" ]; then
     asset=""
-    if [[ "$MANUAL" != [Yy1]* ]]; then
+    if ! enabled "$MANUAL"; then
       MANUAL="Y"
       warn "no answer file provided, $FB."
     fi
@@ -1059,23 +1091,30 @@ updateImage() {
   src=$(find "$dir" -maxdepth 1 -type d -iname sources -print -quit)
 
   if [ ! -d "$src" ]; then
-    error "failed to locate 'sources' folder in ISO image, $FB" && return 1
+    error "failed to locate 'sources' folder in ISO image, $FB"
+    return 1
   fi
 
   wim=$(find "$src" -maxdepth 1 -type f \( -iname boot.wim -or -iname boot.esd \) -print -quit)
 
   if [ ! -f "$wim" ]; then
-    error "failed to locate 'boot.wim' or 'boot.esd' in ISO image, $FB" && return 1
+    error "failed to locate 'boot.wim' or 'boot.esd' in ISO image, $FB"
+    return 1
   fi
 
-  index="1"
-  result=$(wimlib-imagex info -xml "$wim" | iconv -f UTF-16LE -t UTF-8)
+  idx="1"
 
-  if [[ "${result^^}" == *"<IMAGE INDEX=\"2\">"* ]]; then
-    index="2"
+  if ! info=$(wimlib-imagex info -xml "$wim" | iconv -f UTF-16LE -t UTF-8); then
+    warn "failed to read boot image information, $FB"
+    MANUAL="Y"
+    info=""
   fi
 
-  if ! addDrivers "$src" "$tmp" "$wim" "$index" "$DETECTED"; then
+  if [[ "${info^^}" == *"<IMAGE INDEX=\"2\">"* ]]; then
+    idx="2"
+  fi
+
+  if ! addDrivers "$src" "$tmp" "$wim" "$idx" "$DETECTED"; then
     error "Failed to add drivers to image!"
   fi
 
@@ -1083,55 +1122,69 @@ updateImage() {
     error "Failed to add OEM folder to image!"
   fi
 
-  if wimlib-imagex extract "$wim" "$index" "/$file" "--dest-dir=$tmp" >/dev/null 2>&1; then
-    if ! wimlib-imagex extract "$wim" "$index" "/$dat" "--dest-dir=$tmp" >/dev/null 2>&1; then
-      if ! wimlib-imagex extract "$wim" "$index" "/$org" "--dest-dir=$tmp" >/dev/null 2>&1; then
-        if ! wimlib-imagex update "$wim" "$index" --command "rename /$file /$org" > /dev/null; then
-          warn "failed to backup original answer file ($file)."
+  if wimlib-imagex extract "$wim" "$idx" "/$xml" "--dest-dir=$tmp" >/dev/null 2>&1; then
+    if ! wimlib-imagex extract "$wim" "$idx" "/$dat" "--dest-dir=$tmp" >/dev/null 2>&1; then
+      if ! wimlib-imagex extract "$wim" "$idx" "/$bak" "--dest-dir=$tmp" >/dev/null 2>&1; then
+        if ! wimlib-imagex update "$wim" "$idx" --command "rename /$xml /$bak" > /dev/null; then
+          warn "failed to backup original answer file ($xml)."
         fi
       fi
     fi
   fi
 
-  if [[ "$MANUAL" != [Yy1]* ]]; then
+  if ! enabled "$MANUAL"; then
 
-    xml=$(basename "$asset")
-    info "Adding $xml for automatic installation..."
+    name=$(basename "$asset")
+    local answer="$tmp/$name"
 
-    local answer="$tmp/$xml"
-    cp "$asset" "$answer"
-    updateXML "$answer" "$language"
+    info "Adding $name for automatic installation..."
 
-    if ! wimlib-imagex update "$wim" "$index" --command "add $answer /$file" > /dev/null; then
+    if ! cp "$asset" "$answer"; then
+      error "Failed to copy answer file to $answer."
+      return 1
+    fi
+
+    if ! updateXML "$answer" "$language"; then
+      error "Failed to update answer file: $answer"
+      return 1
+    fi
+
+    if ! wimlib-imagex update "$wim" "$idx" --command "add $answer /$xml" > /dev/null; then
       MANUAL="Y"
-      warn "failed to add answer file ($xml) to ISO image, $FB"
+      warn "failed to add answer file ($name) to ISO image, $FB"
     else
-      wimlib-imagex update "$wim" "$index" --command "add $answer /$dat" > /dev/null || true
+      wimlib-imagex update "$wim" "$idx" --command "add $answer /$dat" > /dev/null || true
     fi
 
   fi
 
-  if [[ "$MANUAL" == [Yy1]* ]]; then
+  if enabled "$MANUAL"; then
 
-    wimlib-imagex update "$wim" "$index" --command "delete --force /$file" > /dev/null || true
+    wimlib-imagex update "$wim" "$idx" --command "delete --force /$xml" > /dev/null || true
 
-    if wimlib-imagex extract "$wim" "$index" "/$org" "--dest-dir=$tmp" >/dev/null 2>&1; then
-      if ! wimlib-imagex update "$wim" "$index" --command "add $tmp/$org /$file" > /dev/null; then
-        warn "failed to restore original answer file ($org)."
+    if wimlib-imagex extract "$wim" "$idx" "/$bak" "--dest-dir=$tmp" >/dev/null 2>&1; then
+      if ! wimlib-imagex update "$wim" "$idx" --command "add $tmp/$bak /$xml" > /dev/null; then
+        warn "failed to restore original answer file ($bak)."
       fi
     fi
 
   fi
 
-  local find="$file"
-  [[ "$MANUAL" == [Yy1]* ]] && find="$org"
-  path=$(find "$dir" -maxdepth 1 -type f -iname "$find" -print -quit)
+  name="$xml"
+  enabled "$MANUAL" && name="$bak"
+  path=$(find "$dir" -maxdepth 1 -type f -iname "$name" -print -quit)
 
   if [ -f "$path" ]; then
-    if [[ "$MANUAL" != [Yy1]* ]]; then
-      mv -f "$path" "${path%.*}.org"
+    if ! enabled "$MANUAL"; then
+      if ! mv -f "$path" "${path%.*}.org"; then
+        error "Failed to rename answer file: $path"
+        return 1
+      fi
     else
-      mv -f "$path" "${path%.*}.xml"
+      if ! mv -f "$path" "${path%.*}.xml"; then
+        error "Failed to rename answer file: $path"
+        return 1
+      fi
     fi
   fi
 
@@ -1157,7 +1210,7 @@ buildImage() {
   local failed=""
   local cat="BOOT.CAT"
   local log="/run/shm/iso.log"
-  local base size size_gb space space_gb desc
+  local base size desc
 
   if [ -f "$BOOT" ]; then
     error "File $BOOT does already exist?!" && return 1
@@ -1179,13 +1232,7 @@ buildImage() {
   fi
 
   size=$(du -b --max-depth=0 "$dir" | cut -f1)
-  size_gb=$(formatBytes "$size")
-  space=$(df --output=avail -B 1 "$TMP" | tail -n 1)
-  space_gb=$(formatBytes "$space")
-
-  if (( size > space )); then
-    error "Not enough free space in $STORAGE, have $space_gb available but need at least $size_gb." && return 1
-  fi
+  checkFreeSpace "$TMP" "$size" || return 1
 
   /run/progress.sh "$out" "$size" "$msg ([P])..." &
 
@@ -1223,57 +1270,31 @@ buildImage() {
   [[ "$err" != "$hide" ]] && echo "$err"
 
   mv -f "$out" "$BOOT" || return 1
-  ! setOwner "$BOOT" && error "Failed to set the owner for \"$BOOT\" !"
+
+  if ! setOwner "$BOOT"; then
+    error "Failed to set the owner for \"$BOOT\" !"
+    return 1
+  fi
 
   return 0
 }
 
 bootWindows() {
 
-  if [ -f "$STORAGE/windows.args" ]; then
-    ARGS=$(<"$STORAGE/windows.args")
-    ARGS="${ARGS//[![:print:]]/}"
+  ARGS=$(readState "$STORAGE/windows.args") || return 1
+
+  if [ -n "$ARGS" ]; then
     ARGUMENTS="$ARGS ${ARGUMENTS:-}"
   fi
 
-  if [ -s "$STORAGE/windows.vga" ] && [ -f "$STORAGE/windows.vga" ]; then
-    if [ -z "${VGA:-}" ]; then
-      VGA=$(<"$STORAGE/windows.vga")
-      VGA="${VGA//[![:print:]]/}"
-    fi
-  fi
+  restoreState "VGA" "$STORAGE/windows.vga" || return 1
+  restoreState "USB" "$STORAGE/windows.usb" || return 1
+  restoreState "ADAPTER" "$STORAGE/windows.net" || return 1
+  restoreState "DISK_TYPE" "$STORAGE/windows.type" || return 1
+  restoreState "BOOT_MODE" "$STORAGE/windows.mode" "Y" || return 1
 
-  if [ -s "$STORAGE/windows.usb" ] && [ -f "$STORAGE/windows.usb" ]; then
-    if [ -z "${USB:-}" ]; then
-      USB=$(<"$STORAGE/windows.usb")
-      USB="${USB//[![:print:]]/}"
-    fi
-  fi
-
-  if [ -s "$STORAGE/windows.net" ] && [ -f "$STORAGE/windows.net" ]; then
-    if [ -z "${ADAPTER:-}" ]; then
-      ADAPTER=$(<"$STORAGE/windows.net")
-      ADAPTER="${ADAPTER//[![:print:]]/}"
-    fi
-  fi
-
-  if [ -s "$STORAGE/windows.type" ] && [ -f "$STORAGE/windows.type" ]; then
-    if [ -z "${DISK_TYPE:-}" ]; then
-      DISK_TYPE=$(<"$STORAGE/windows.type")
-      DISK_TYPE="${DISK_TYPE//[![:print:]]/}"
-    fi
-  fi
-
-  if [ -s "$STORAGE/windows.mode" ] && [ -f "$STORAGE/windows.mode" ]; then
-    BOOT_MODE=$(<"$STORAGE/windows.mode")
-    BOOT_MODE="${BOOT_MODE//[![:print:]]/}"
-  fi
-
-  if [ -s "$STORAGE/windows.old" ] && [ -f "$STORAGE/windows.old" ]; then
-    if [[ "${PLATFORM,,}" == "x64" ]]; then
-      MACHINE=$(<"$STORAGE/windows.old")
-      MACHINE="${MACHINE//[![:print:]]/}"
-    fi
+  if [[ "${PLATFORM,,}" == "x64" ]]; then
+    restoreState "MACHINE" "$STORAGE/windows.old" "Y" || return 1
   fi
 
   return 0
