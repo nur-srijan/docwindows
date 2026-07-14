@@ -77,12 +77,13 @@ kubectl apply -f https://raw.githubusercontent.com/dockur/windows/refs/heads/mas
 
 ## Requirements ⚙️
 
- - A Linux host with KVM support, or Docker Desktop / Podman on Windows 11 with nested virtualization enabled.
- - At least 4 GB of RAM available.
- - At least 64 GB of free disk space.
+- Docker or Podman on a Linux host with KVM support.
+- Docker Desktop or Podman (Desktop) on Windows 11 with nested virtualization enabled.
+- At least 4 GB of available RAM.
+- At least 64 GB of free disk space.
 
 > [!NOTE]
-> Docker Desktop on macOS and Windows 10 do not currently provide the required KVM support for this image.
+> Docker Desktop on Linux, macOS, and Windows 10 does not currently provide KVM access to containers and is therefore not supported.
 
 ## FAQ 💬
 
@@ -263,11 +264,22 @@ kubectl apply -f https://raw.githubusercontent.com/dockur/windows/refs/heads/mas
 
 ### How do I connect using RDP?
 
-  The web viewer is mainly meant to be used during installation, as its picture quality is low, and it has no audio or clipboard for example.
+  The web viewer is mainly intended for use during installation, since it is less responsive than RDP and does not support features such as clipboard sharing.
 
   So for a better experience you can connect using any Microsoft Remote Desktop client to the IP of the container, using the username `Docker` and password `admin`.
 
   There is an RDP client for [Android](https://play.google.com/store/apps/details?id=com.microsoft.rdc.androidx) available from the Play Store and one for [iOS](https://apps.apple.com/nl/app/microsoft-remote-desktop/id714464092?l=en-GB) in the Apple Store. For Linux you can use [FreeRDP](https://www.freerdp.com/) and on Windows just type `mstsc` in the search box.
+
+### How do I enable audio?
+
+    Audio is disabled by default unless you are using RDP. To stream it to the browser, add the following environment variable:
+
+  ```yaml
+  environment:
+    AUDIO: "Y"
+  ```
+
+  Then enable **Audio** under **Settings → Advanced** in the web viewer. The stream is only active while this option is enabled, so it uses no extra bandwidth otherwise.
 
 ### How do I assign an individual IP address to the container?
 
@@ -362,35 +374,38 @@ kubectl apply -f https://raw.githubusercontent.com/dockur/windows/refs/heads/mas
 
 ### Are these all available options?
 
-No. For a complete overview of all supported settings, see the [environment variables](docs/environment.md) page.
+  No. For a complete overview of all supported settings, see the [environment variables](docs/environment.md) page.
 
-### How do I verify if my system supports KVM?
+### How do I verify that KVM is available?
 
-  First check if your software is compatible using this chart:
+  First, make sure your platform and container runtime meet the [requirements](#requirements-️) listed above.
 
-  | **Product**  | **Linux** | **Win11** | **Win10** | **macOS** |
-  |---|---|---|---|---|
-  | Docker CLI        | ✅   | ✅       | ❌        | ❌ |
-  | Docker Desktop    | ❌   | ✅       | ❌        | ❌ | 
-  | Podman CLI        | ✅   | ✅       | ❌        | ❌ | 
-  | Podman Desktop    | ✅   | ✅       | ❌        | ❌ | 
-
-  After that you can run the following commands in Linux to check your system:
+  On a Linux host, install `cpu-checker` and run:
 
   ```bash
   sudo apt install cpu-checker
   sudo kvm-ok
   ```
 
-  If you receive an error from `kvm-ok` indicating that KVM cannot be used, please check whether:
+  A working configuration should report:
 
-  - the virtualization extensions (`Intel VT-x` or `AMD SVM`) are enabled in your BIOS.
+  ```text
+  KVM acceleration can be used
+  ```
 
-  - you enabled "nested virtualization" if you are running the container inside a virtual machine.
+  You can also verify that the KVM device exists:
 
-  - you are not using a cloud provider, as most of them do not allow nested virtualization for their VPSs.
+  ```bash
+  ls -l /dev/kvm
+  ```
 
-  If you did not receive any error from `kvm-ok` but the container still complains about a missing KVM device, it could help to add `privileged: true` to your compose file (or `sudo` to your `docker` command) to rule out any permission issue.
+  If KVM is unavailable, check whether:
+
+  - Hardware virtualization (`Intel VT-x` or `AMD-V`) is enabled in your BIOS or UEFI.
+  - Nested virtualization is enabled when the host itself is a virtual machine.
+  - Your VPS or cloud provider supports nested virtualization.
+
+  If `kvm-ok` succeeds but the container still reports that KVM is unavailable, you can temporarily add `privileged: true` to your Compose file to rule out a permission or device-access issue.
 
 ### How do I run macOS in a container?
 
