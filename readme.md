@@ -1,35 +1,3 @@
-<h1 align="center">Windows<br />
-<div align="center">
-<a href="https://github.com/dockur/windows"><img src="https://github.com/dockur/windows/raw/master/.github/logo.png" title="Logo" style="max-width:100%;" width="96" /></a>
-</div>
-<div align="center">
-
-[![Build]][build_url]
-[![Version]][tag_url]
-[![Size]][tag_url]
-[![Package]][pkg_url]
-[![Pulls]][hub_url]
-
-</div></h1>
-
-Windows inside a Docker container.
-
-## Features ✨
-
-- Runs Windows inside a Docker container
-- Automatic download and hands-free installation
-- Supports modern and legacy Windows releases
-- Near-native performance with KVM acceleration
-- Customizable CPU, memory, and storage allocation
-- Dynamic memory allocation with memory ballooning
-- USB passthrough and host folder sharing
-- Supports NAT, user-mode, macvlan, and macvtap networking
-
-## Video 📺
-
-[![YouTube](https://img.youtube.com/vi/xhGYobuG508/maxresdefault.jpg)](https://www.youtube.com/watch?v=xhGYobuG508)
-
-## Usage 🐳
 
 ##### Docker Compose:
 
